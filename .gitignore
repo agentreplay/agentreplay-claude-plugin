@@ -1,0 +1,18 @@
+# Ignore macOS files
+.DS_Store
+
+# Ignore editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Ignore node_modules if any dev work
+node_modules/
+
+# Ignore logs
+*.log
+
+# Ignore local config
+.agentreplay-claude/
