@@ -16,13 +16,15 @@ var require_api = __commonJS({
     function nowMicros() {
       return BigInt(Date.now()) * 1000n;
     }
-    function getProjectCachePath() {
-      const cacheDir = nodePath.join(nodeOs.homedir(), ".agentreplay");
-      if (!nodeFs.existsSync(cacheDir)) {
-        nodeFs.mkdirSync(cacheDir, { recursive: true });
+    function getClaudeCodeProjectId() {
+      const name = "Claude Code";
+      let hash = 0;
+      for (let i = 0; i < name.length; i++) {
+        hash = (hash << 5) - hash + name.charCodeAt(i) & 65535;
       }
-      return nodePath.join(cacheDir, "claude-code-project.json");
+      return hash || 1;
     }
+    var CLAUDE_CODE_PROJECT_ID = getClaudeCodeProjectId();
     var AgentReplayAPI2 = class {
       #endpoint;
       #tenantId;
@@ -50,65 +52,31 @@ var require_api = __commonJS({
         return this.#projectId;
       }
       // -------------------------------------------------------------------------
-      // Project Management - Auto-create "Claude Code" project
+      // Project Management - Use deterministic "Claude Code" project ID
       // -------------------------------------------------------------------------
       async ensureProject() {
         if (this.#projectInitialized && this.#projectId) {
           return this.#projectId;
         }
-        const cachePath = getProjectCachePath();
-        try {
-          if (nodeFs.existsSync(cachePath)) {
-            const cached = JSON.parse(nodeFs.readFileSync(cachePath, "utf8"));
-            if (cached.projectId && cached.tenantId === this.#tenantId) {
-              this.#projectId = cached.projectId;
-              this.#projectInitialized = true;
-              return this.#projectId;
-            }
-          }
-        } catch (e) {
-        }
+        this.#projectId = CLAUDE_CODE_PROJECT_ID;
+        this.#projectInitialized = true;
+        this.#registerProjectIfNeeded().catch(() => {
+        });
+        return this.#projectId;
+      }
+      async #registerProjectIfNeeded() {
         try {
           const res = await this.#callRaw("GET", "/api/v1/projects");
           const projects = res.projects || [];
           const existing = projects.find(
-            (p) => p.name === "Claude Code" || p.name === "claude-code" || p.name?.toLowerCase() === "claude code"
+            (p) => Number(p.project_id) === CLAUDE_CODE_PROJECT_ID || p.name === "Claude Code"
           );
-          if (existing) {
-            this.#projectId = Number(existing.project_id);
-            this.#projectInitialized = true;
-            this.#saveProjectCache(this.#projectId);
-            return this.#projectId;
+          if (!existing) {
+            await this.#callRaw("POST", "/api/v1/projects", {
+              name: "Claude Code",
+              description: "Claude Code coding sessions"
+            });
           }
-        } catch (e) {
-        }
-        try {
-          const res = await this.#callRaw("POST", "/api/v1/projects", {
-            name: "Claude Code",
-            description: "Auto-created project for Claude Code sessions"
-          });
-          if (res.project_id) {
-            this.#projectId = Number(res.project_id);
-            this.#projectInitialized = true;
-            this.#saveProjectCache(this.#projectId);
-            return this.#projectId;
-          }
-        } catch (e) {
-          console.error("[AgentReplay] Failed to create project:", e.message);
-        }
-        this.#projectId = 1;
-        this.#projectInitialized = true;
-        return this.#projectId;
-      }
-      #saveProjectCache(projectId) {
-        try {
-          const cachePath = getProjectCachePath();
-          nodeFs.writeFileSync(cachePath, JSON.stringify({
-            projectId,
-            tenantId: this.#tenantId,
-            name: "Claude Code",
-            createdAt: (/* @__PURE__ */ new Date()).toISOString()
-          }));
         } catch (e) {
         }
       }
