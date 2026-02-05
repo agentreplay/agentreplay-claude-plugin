@@ -1,0 +1,23 @@
+{
+  "name": "agentreplay",
+  "owner": {
+    "name": "AgentReplay",
+    "email": "hello@agentreplay.dev"
+  },
+  "metadata": {
+    "description": "Official Agent Replay plugins for Claude Code",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "agentreplay",
+      "source": "./",
+      "description": "Observability tracing and persistent memory for Claude Code",
+      "version": "0.2.0",
+      "author": {
+        "name": "AgentReplay"
+      },
+      "keywords": ["observability", "tracing", "memory", "persistence"]
+    }
+  ]
+}
