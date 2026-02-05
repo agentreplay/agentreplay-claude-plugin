@@ -6,35 +6,33 @@ var __commonJS = (cb, mod) => function __require() {
 // src/api.js
 var require_api = __commonJS({
   "src/api.js"(exports2, module2) {
-    var SpanType2 = Object.freeze({
-      Root: 0,
-      Planning: 1,
-      Reasoning: 2,
-      ToolCall: 3,
-      ToolResponse: 4,
-      Synthesis: 5,
-      Response: 6,
-      Error: 7,
-      Retrieval: 8,
-      Embedding: 9,
-      HttpCall: 10,
-      Database: 11,
-      Function: 12,
-      Custom: 255
-    });
+    var crypto = require("node:crypto");
+    function randomHexId(bytes = 8) {
+      return "0x" + crypto.randomBytes(bytes).toString("hex");
+    }
+    function nowMicros() {
+      return BigInt(Date.now()) * 1000n;
+    }
     var AgentReplayAPI2 = class {
       #endpoint;
       #tenantId;
       #projectId;
       #timeout;
+      #currentTraceId;
+      #currentSessionId;
       constructor(config) {
         this.#endpoint = String(config.serverUrl || "http://localhost:47100").replace(/\/+$/, "");
         this.#tenantId = Number(config.tenantId || 1);
         this.#projectId = Number(config.projectId || 1);
         this.#timeout = config.timeout || 3e4;
+        this.#currentTraceId = randomHexId(16);
+        this.#currentSessionId = process.env.CLAUDE_SESSION_ID || randomHexId(8);
       }
       get baseUrl() {
         return this.#endpoint;
+      }
+      get traceId() {
+        return this.#currentTraceId;
       }
       // -------------------------------------------------------------------------
       // Health
@@ -48,37 +46,59 @@ var require_api = __commonJS({
         }
       }
       // -------------------------------------------------------------------------
-      // Tracing API
+      // Tracing API - Using proper span format
       // -------------------------------------------------------------------------
-      async sendTrace(spanType, meta = {}, parentEdgeId = null, tokenCount = null) {
-        const body = {
-          tenant_id: this.#tenantId,
-          project_id: this.#projectId,
-          agent_id: this.#hashStr("claude-code"),
-          session_id: this.#getSessionId(),
-          span_type: spanType
-        };
-        if (parentEdgeId) body.parent_edge_id = parentEdgeId;
-        if (tokenCount) body.token_count = tokenCount;
-        if (meta && Object.keys(meta).length > 0) body.metadata = meta;
-        return this.#call("POST", "/api/v1/traces", body);
-      }
-      async sendToolTrace(toolName, input, output, durationMs = null, parentEdgeId = null) {
-        const body = {
-          tenant_id: this.#tenantId,
-          project_id: this.#projectId,
-          agent_id: this.#hashStr("claude-code"),
-          session_id: this.#getSessionId(),
-          span_type: SpanType2.ToolCall,
-          metadata: {
-            tool_name: toolName,
-            tool_input: this.#truncate(JSON.stringify(input), 2e3),
-            tool_output: this.#truncate(JSON.stringify(output), 2e3)
+      async sendSpan(name, attributes = {}, parentSpanId = null, startTime = null, endTime = null) {
+        const spanId = randomHexId(8);
+        const now = nowMicros();
+        const span = {
+          span_id: spanId,
+          trace_id: this.#currentTraceId,
+          parent_span_id: parentSpanId,
+          name,
+          start_time: Number(startTime || now),
+          end_time: endTime ? Number(endTime) : Number(now + 1000n),
+          attributes: {
+            "agent.name": "claude-code",
+            "session.id": this.#currentSessionId,
+            "tenant.id": String(this.#tenantId),
+            "project.id": String(this.#projectId),
+            ...Object.fromEntries(
+              Object.entries(attributes).map(([k, v]) => [k, String(v)])
+            )
           }
         };
-        if (durationMs != null) body.duration_ms = durationMs;
-        if (parentEdgeId) body.parent_edge_id = parentEdgeId;
-        return this.#call("POST", "/api/v1/traces", body);
+        const body = { spans: [span] };
+        try {
+          await this.#call("POST", "/api/v1/traces", body);
+          return spanId;
+        } catch (e) {
+          console.error(`[AgentReplay] Trace send failed: ${e.message}`);
+          return null;
+        }
+      }
+      async sendRootSpan(workspace, project) {
+        return this.sendSpan("session.start", {
+          "event.type": "session_start",
+          "workspace.path": workspace || "",
+          "project.name": project || ""
+        });
+      }
+      async sendToolSpan(toolName, input, output, durationMs = null, parentSpanId = null) {
+        const startTime = nowMicros();
+        const endTime = durationMs ? startTime + BigInt(durationMs * 1e3) : startTime + 1000n;
+        return this.sendSpan(`tool.${toolName}`, {
+          "tool.name": toolName,
+          "tool.input": this.#truncate(JSON.stringify(input), 2e3),
+          "tool.output": this.#truncate(JSON.stringify(output), 2e3),
+          "tool.duration_ms": String(durationMs || 0)
+        }, parentSpanId, startTime, endTime);
+      }
+      async sendEndSpan(reason = "normal", parentSpanId = null) {
+        return this.sendSpan("session.end", {
+          "event.type": "session_end",
+          "session.end_reason": reason
+        }, parentSpanId);
       }
       // -------------------------------------------------------------------------
       // Memory API
@@ -157,22 +177,11 @@ var require_api = __commonJS({
           clearTimeout(timer);
         }
       }
-      #hashStr(s) {
-        let h = 0;
-        for (let i = 0; i < s.length; i++) {
-          h = (h << 5) - h + s.charCodeAt(i) | 0;
-        }
-        return Math.abs(h);
-      }
-      #getSessionId() {
-        const key = process.env.CLAUDE_SESSION_ID || (/* @__PURE__ */ new Date()).toISOString().slice(0, 13);
-        return this.#hashStr(key);
-      }
       #truncate(s, max) {
         return s && s.length > max ? s.slice(0, max) + "..." : s;
       }
     };
-    module2.exports = { AgentReplayAPI: AgentReplayAPI2, SpanType: SpanType2 };
+    module2.exports = { AgentReplayAPI: AgentReplayAPI2 };
   }
 });
 
@@ -305,7 +314,7 @@ var require_common = __commonJS({
 
 // src/hooks/stop.js
 var nodeFs = require("node:fs");
-var { AgentReplayAPI, SpanType } = require_api();
+var { AgentReplayAPI } = require_api();
 var { loadConfig, log, computeWorkspaceId, extractProjectName, parseStdin, respond, readState, writeState } = require_common();
 function extractTranscript(transcriptPath, sessionId) {
   if (!transcriptPath || !nodeFs.existsSync(transcriptPath)) return null;
@@ -349,12 +358,9 @@ function extractTranscript(transcriptPath, sessionId) {
     const projectName = extractProjectName(cwd);
     if (cfg.tracingEnabled) {
       try {
-        const parentState = readState("parent_edge");
-        await api.sendTrace(SpanType.Response, {
-          event: "session_end",
-          agent: "claude-code",
-          reason: input.reason || "normal"
-        }, parentState.edgeId);
+        const parentState = readState("parent_span");
+        await api.sendEndSpan(input.reason || "normal", parentState.spanId);
+        log(cfg, "Session end traced");
       } catch (e) {
         log(cfg, "Trace error", e.message);
       }
@@ -375,7 +381,7 @@ function extractTranscript(transcriptPath, sessionId) {
         log(cfg, "Memory error", e.message);
       }
     }
-    writeState("parent_edge", {});
+    writeState("parent_span", {});
     respond({ continue: true });
   } catch (err) {
     log(cfg, "Hook error", err.message);
