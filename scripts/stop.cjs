@@ -7,11 +7,21 @@ var __commonJS = (cb, mod) => function __require() {
 var require_api = __commonJS({
   "src/api.js"(exports2, module2) {
     var crypto = require("node:crypto");
+    var nodeFs2 = require("node:fs");
+    var nodePath = require("node:path");
+    var nodeOs = require("node:os");
     function randomHexId(bytes = 8) {
       return "0x" + crypto.randomBytes(bytes).toString("hex");
     }
     function nowMicros() {
       return BigInt(Date.now()) * 1000n;
+    }
+    function getProjectCachePath() {
+      const cacheDir = nodePath.join(nodeOs.homedir(), ".agentreplay");
+      if (!nodeFs2.existsSync(cacheDir)) {
+        nodeFs2.mkdirSync(cacheDir, { recursive: true });
+      }
+      return nodePath.join(cacheDir, "claude-code-project.json");
     }
     var AgentReplayAPI2 = class {
       #endpoint;
@@ -20,13 +30,15 @@ var require_api = __commonJS({
       #timeout;
       #currentTraceId;
       #currentSessionId;
+      #projectInitialized;
       constructor(config) {
         this.#endpoint = String(config.serverUrl || "http://localhost:47100").replace(/\/+$/, "");
         this.#tenantId = Number(config.tenantId || 1);
-        this.#projectId = Number(config.projectId || 1);
+        this.#projectId = null;
         this.#timeout = config.timeout || 3e4;
         this.#currentTraceId = randomHexId(16);
         this.#currentSessionId = process.env.CLAUDE_SESSION_ID || randomHexId(8);
+        this.#projectInitialized = false;
       }
       get baseUrl() {
         return this.#endpoint;
@@ -34,12 +46,78 @@ var require_api = __commonJS({
       get traceId() {
         return this.#currentTraceId;
       }
+      get projectId() {
+        return this.#projectId;
+      }
+      // -------------------------------------------------------------------------
+      // Project Management - Auto-create "Claude Code" project
+      // -------------------------------------------------------------------------
+      async ensureProject() {
+        if (this.#projectInitialized && this.#projectId) {
+          return this.#projectId;
+        }
+        const cachePath = getProjectCachePath();
+        try {
+          if (nodeFs2.existsSync(cachePath)) {
+            const cached = JSON.parse(nodeFs2.readFileSync(cachePath, "utf8"));
+            if (cached.projectId && cached.tenantId === this.#tenantId) {
+              this.#projectId = cached.projectId;
+              this.#projectInitialized = true;
+              return this.#projectId;
+            }
+          }
+        } catch (e) {
+        }
+        try {
+          const res = await this.#callRaw("GET", "/api/v1/projects");
+          const projects = res.projects || [];
+          const existing = projects.find(
+            (p) => p.name === "Claude Code" || p.name === "claude-code" || p.name?.toLowerCase() === "claude code"
+          );
+          if (existing) {
+            this.#projectId = Number(existing.project_id);
+            this.#projectInitialized = true;
+            this.#saveProjectCache(this.#projectId);
+            return this.#projectId;
+          }
+        } catch (e) {
+        }
+        try {
+          const res = await this.#callRaw("POST", "/api/v1/projects", {
+            name: "Claude Code",
+            description: "Auto-created project for Claude Code sessions"
+          });
+          if (res.project_id) {
+            this.#projectId = Number(res.project_id);
+            this.#projectInitialized = true;
+            this.#saveProjectCache(this.#projectId);
+            return this.#projectId;
+          }
+        } catch (e) {
+          console.error("[AgentReplay] Failed to create project:", e.message);
+        }
+        this.#projectId = 1;
+        this.#projectInitialized = true;
+        return this.#projectId;
+      }
+      #saveProjectCache(projectId) {
+        try {
+          const cachePath = getProjectCachePath();
+          nodeFs2.writeFileSync(cachePath, JSON.stringify({
+            projectId,
+            tenantId: this.#tenantId,
+            name: "Claude Code",
+            createdAt: (/* @__PURE__ */ new Date()).toISOString()
+          }));
+        } catch (e) {
+        }
+      }
       // -------------------------------------------------------------------------
       // Health
       // -------------------------------------------------------------------------
       async ping() {
         try {
-          await this.#call("GET", "/api/v1/health");
+          await this.#callRaw("GET", "/api/v1/health");
           return { ok: true };
         } catch (e) {
           return { ok: false, error: e.message };
@@ -49,6 +127,7 @@ var require_api = __commonJS({
       // Tracing API - Using proper span format
       // -------------------------------------------------------------------------
       async sendSpan(name, attributes = {}, parentSpanId = null, startTime = null, endTime = null) {
+        await this.ensureProject();
         const spanId = randomHexId(8);
         const now = nowMicros();
         const span = {
@@ -59,10 +138,11 @@ var require_api = __commonJS({
           start_time: Number(startTime || now),
           end_time: endTime ? Number(endTime) : Number(now + 1000n),
           attributes: {
-            "agent.name": "claude-code",
-            "session.id": this.#currentSessionId,
-            "tenant.id": String(this.#tenantId),
-            "project.id": String(this.#projectId),
+            // Use exact attribute names the server expects
+            "agent_id": "claude-code",
+            "session_id": this.#currentSessionId,
+            "tenant_id": String(this.#tenantId),
+            "project_id": String(this.#projectId),
             ...Object.fromEntries(
               Object.entries(attributes).map(([k, v]) => [k, String(v)])
             )
@@ -152,7 +232,36 @@ var require_api = __commonJS({
       // -------------------------------------------------------------------------
       // Internals
       // -------------------------------------------------------------------------
+      // Raw call without project_id (used for project listing/creation)
+      async #callRaw(method, path, body = null) {
+        const url = `${this.#endpoint}${path}`;
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), this.#timeout);
+        try {
+          const opts = {
+            method,
+            headers: {
+              "Content-Type": "application/json",
+              "X-Tenant-ID": String(this.#tenantId)
+            },
+            signal: ctrl.signal
+          };
+          if (body) opts.body = JSON.stringify(body);
+          const res = await fetch(url, opts);
+          if (!res.ok) {
+            const txt = await res.text();
+            throw new Error(`HTTP ${res.status}: ${txt}`);
+          }
+          return res.json();
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      // Call with project_id header
       async #call(method, path, body = null) {
+        if (!this.#projectId) {
+          await this.ensureProject();
+        }
         const url = `${this.#endpoint}${path}`;
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), this.#timeout);

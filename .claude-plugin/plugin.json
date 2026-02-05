@@ -1,6 +1,6 @@
 {
   "name": "agentreplay",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Agent Replay plugin for Claude Code - observability tracing and persistent memory for AI coding sessions",
   "author": {
     "name": "AgentReplay",
