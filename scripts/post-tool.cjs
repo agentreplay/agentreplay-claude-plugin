@@ -391,7 +391,62 @@ var require_common = __commonJS({
 
 // src/hooks/post-tool.js
 var { AgentReplayAPI } = require_api();
-var { loadConfig, log, parseStdin, respond, readState } = require_common();
+var { loadConfig, log, parseStdin, respond, readState, computeWorkspaceId, extractProjectName } = require_common();
+
+// ---------------------------------------------------------------------------
+// PostToolUse Memory: Lightweight observation extraction (no LLM needed)
+// Only stores memories for high-signal tools (Write, Edit, Bash, MultiEdit, Task)
+// Read-only tools (Read, Glob, Grep, LS) are already in ignoredTools
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a concise, searchable memory string from tool input/output.
+ * Returns null if the tool use isn't worth remembering.
+ */
+function buildToolMemory(toolName, toolInput, toolOutput) {
+  const isError = typeof toolOutput === 'object' && toolOutput.is_error === true;
+  const outputStr = typeof toolOutput === 'string' ? toolOutput :
+    (toolOutput.content || toolOutput.output || toolOutput.result || JSON.stringify(toolOutput));
+
+  switch (toolName) {
+    case 'Write': {
+      const filePath = toolInput.file_path || toolInput.path || '(unknown file)';
+      const content = String(toolInput.content || '');
+      const firstLines = content.split('\n').slice(0, 3).join(' ').slice(0, 200);
+      return `[Write] Created ${filePath} — ${firstLines}`;
+    }
+    case 'Edit': {
+      const filePath = toolInput.file_path || toolInput.path || '(unknown file)';
+      const oldStr = String(toolInput.old_string || '').slice(0, 80);
+      const newStr = String(toolInput.new_string || '').slice(0, 80);
+      return `[Edit] Modified ${filePath} — changed "${oldStr}" → "${newStr}"`;
+    }
+    case 'MultiEdit': {
+      const filePath = toolInput.file_path || toolInput.path || '(unknown file)';
+      const edits = toolInput.edits || [];
+      return `[MultiEdit] Modified ${filePath} — ${edits.length} edit(s) applied`;
+    }
+    case 'Bash': {
+      const cmd = String(toolInput.command || toolInput.cmd || '').slice(0, 300);
+      if (!cmd) return null;
+      // Skip trivial commands
+      if (/^(ls|pwd|echo|cat|head|tail|wc)\b/.test(cmd.trim())) return null;
+      const out = String(outputStr).slice(0, 300);
+      if (isError) {
+        return `[Bash ERROR] \`${cmd}\` — ${out}`;
+      }
+      return `[Bash] \`${cmd}\` — ${out}`;
+    }
+    case 'Task': {
+      const desc = String(toolInput.description || toolInput.prompt || '').slice(0, 300);
+      const result = String(outputStr).slice(0, 300);
+      return `[Task] ${desc} — Result: ${result}`;
+    }
+    default:
+      return null;
+  }
+}
+
 (async () => {
   const cfg = loadConfig();
   try {
@@ -404,28 +459,58 @@ var { loadConfig, log, parseStdin, respond, readState } = require_common();
       respond({ continue: true, suppressOutput: true });
       return;
     }
+
+    const api = new AgentReplayAPI(cfg);
+    const health = await api.ping();
+    if (!health.ok) {
+      respond({ continue: true, suppressOutput: true });
+      return;
+    }
+
+    // 1) Send tracing span (existing behavior)
     if (cfg.tracingEnabled) {
-      const api = new AgentReplayAPI(cfg);
-      const health = await api.ping();
-      if (health.ok) {
-        const toolState = readState(`tool_${toolName}`);
-        const duration = toolState.startTime ? Date.now() - toolState.startTime : null;
-        const parentState = readState("parent_span");
-        const isError = typeof toolOutput === "object" && toolOutput.is_error === true;
+      const toolState = readState(`tool_${toolName}`);
+      const duration = toolState.startTime ? Date.now() - toolState.startTime : null;
+      const parentState = readState("parent_span");
+      const isError = typeof toolOutput === "object" && toolOutput.is_error === true;
+      try {
+        await api.sendToolSpan(
+          toolName,
+          toolInput,
+          toolOutput,
+          duration,
+          parentState.spanId
+        );
+        log(cfg, "Tool traced", { tool: toolName, duration, error: isError });
+      } catch (e) {
+        log(cfg, "Trace error", e.message);
+      }
+    }
+
+    // 2) Store tool observation as memory (NEW — zero-cost, no LLM)
+    if (cfg.memoryEnabled) {
+      const memoryContent = buildToolMemory(toolName, toolInput, toolOutput);
+      if (memoryContent) {
+        const cwd = input.cwd || process.cwd();
+        const wsId = computeWorkspaceId(cwd);
+        const projectName = extractProjectName(cwd);
+        const isError = typeof toolOutput === 'object' && toolOutput.is_error === true;
         try {
-          await api.sendToolSpan(
-            toolName,
-            toolInput,
-            toolOutput,
-            duration,
-            parentState.spanId
-          );
-          log(cfg, "Tool traced", { tool: toolName, duration, error: isError });
+          await api.storeMemory(memoryContent, wsId, {
+            kind: 'tool_observation',
+            tool: toolName,
+            project: projectName,
+            session: process.env.CLAUDE_SESSION_ID || '',
+            error: isError ? 'true' : 'false',
+            when: new Date().toISOString()
+          });
+          log(cfg, "Tool memory stored", { tool: toolName, chars: memoryContent.length });
         } catch (e) {
-          log(cfg, "Trace error", e.message);
+          log(cfg, "Memory store error", e.message);
         }
       }
     }
+
     respond({ continue: true, suppressOutput: true });
   } catch (err) {
     log(cfg, "Hook error", err.message);
